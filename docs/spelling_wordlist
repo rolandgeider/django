@@ -204,6 +204,7 @@ Ess
 ETag
 ETags
 exe
+exfiltration
 extensibility
 Facebook
 fallback
@@ -216,6 +217,7 @@ fieldsets
 filename
 filenames
 filesystem
+filesystems
 fk
 flatpage
 flatpages
@@ -227,7 +229,6 @@ formfield
 formset
 formsets
 formtools
-freenode
 Frysian
 functionalities
 gdal
@@ -330,6 +331,7 @@ Kyrgyz
 latin
 lawrence
 lexer
+Libera
 lifecycle
 lifecycles
 linearize
@@ -608,6 +610,7 @@ sortable
 spam
 spammers
 spatialite
+Spectre
 Springmeyer
 SQL
 ssi
@@ -676,6 +679,7 @@ textarea
 th
 that'll
 Thejaswi
+theming
 This'll
 threadlocals
 threadpool
@@ -748,6 +752,7 @@ unpickled
 unpickling
 unpopulated
 unpythonic
+Unregisters
 unrendered
 unreproducible
 Unreviewed

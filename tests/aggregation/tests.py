@@ -1218,11 +1218,6 @@ class AggregateTestCase(TestCase):
         Subquery annotations must be included in the GROUP BY if they use
         potentially multivalued relations (contain the LOOKUP_SEP).
         """
-        if connection.vendor == 'mysql' and 'ONLY_FULL_GROUP_BY' in connection.sql_mode:
-            self.skipTest(
-                'GROUP BY optimization does not work properly when '
-                'ONLY_FULL_GROUP_BY mode is enabled on MySQL, see #31331.'
-            )
         subquery_qs = Author.objects.filter(
             pk=OuterRef('pk'),
             book__name=OuterRef('book__name'),
@@ -1315,6 +1310,21 @@ class AggregateTestCase(TestCase):
         # with self.assertNumQueries(1) as ctx:
         #     self.assertSequenceEqual(books_qs, [book])
         # self.assertEqual(ctx[0]['sql'].count('SELECT'), 2)
+
+    @skipUnlessDBFeature('supports_subqueries_in_group_by')
+    def test_aggregation_nested_subquery_outerref(self):
+        publisher_with_same_name = Publisher.objects.filter(
+            id__in=Subquery(
+                Publisher.objects.filter(
+                    name=OuterRef(OuterRef('publisher__name')),
+                ).values('id'),
+            ),
+        ).values(publisher_count=Count('id'))[:1]
+        books_breakdown = Book.objects.annotate(
+            publisher_count=Subquery(publisher_with_same_name),
+            authors_count=Count('authors'),
+        ).values_list('publisher_count', flat=True)
+        self.assertSequenceEqual(books_breakdown, [1] * 6)
 
     def test_aggregation_random_ordering(self):
         """Random() is not included in the GROUP BY when used for ordering."""

@@ -633,12 +633,13 @@ On PostgreSQL, the SQL looks like:
 .. code-block:: sql
 
     SELECT "post"."id", "post"."published_at", EXISTS(
-        SELECT U0."id", U0."post_id", U0."email", U0."created_at"
+        SELECT (1) as "a"
         FROM "comment" U0
         WHERE (
             U0."created_at" >= YYYY-MM-DD HH:MM:SS AND
-            U0."post_id" = ("post"."id")
+            U0."post_id" = "post"."id"
         )
+        LIMIT 1
     ) AS "recent_comment" FROM "post"
 
 It's unnecessary to force ``Exists`` to refer to a single column, since the
@@ -698,11 +699,15 @@ Sometimes database expressions can't easily express a complex ``WHERE`` clause.
 In these edge cases, use the ``RawSQL`` expression. For example::
 
     >>> from django.db.models.expressions import RawSQL
-    >>> queryset.annotate(val=RawSQL("select col from sometable where othercol = %s", (someparam,)))
+    >>> queryset.annotate(val=RawSQL("select col from sometable where othercol = %s", (param,)))
 
 These extra lookups may not be portable to different database engines (because
 you're explicitly writing SQL code) and violate the DRY principle, so you
 should avoid them if possible.
+
+``RawSQL`` expressions can also be used as the target of ``__in`` filters::
+
+    >>> queryset.filter(id__in=RawSQL("select id from sometable where col = %s", (param,)))
 
 .. warning::
 
@@ -889,7 +894,7 @@ values of an expression in the partition. If the ``released`` field of the
 example annotates each movie with the average rating of a movie's peers
 released between twelve months before and twelve months after the each movie.
 
-    >>> from django.db.models import Avg, ExpressionList, F, ValueRange, Window
+    >>> from django.db.models import Avg, F, ValueRange, Window
     >>> Movie.objects.annotate(
     >>>     avg_rating=Window(
     >>>         expression=Avg('rating'),

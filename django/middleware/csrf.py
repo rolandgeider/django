@@ -5,8 +5,8 @@ This module provides a middleware that implements protection
 against request forgeries from other sites.
 """
 import logging
-import re
 import string
+from collections import defaultdict
 from urllib.parse import urlparse
 
 from django.conf import settings
@@ -15,11 +15,16 @@ from django.urls import get_callable
 from django.utils.cache import patch_vary_headers
 from django.utils.crypto import constant_time_compare, get_random_string
 from django.utils.deprecation import MiddlewareMixin
+from django.utils.functional import cached_property
 from django.utils.http import is_same_domain
 from django.utils.log import log_response
+from django.utils.regex_helper import _lazy_re_compile
 
 logger = logging.getLogger('django.security.csrf')
+# This matches if any character is not in CSRF_ALLOWED_CHARS.
+invalid_token_chars_re = _lazy_re_compile('[^a-zA-Z0-9]')
 
+REASON_BAD_ORIGIN = "Origin checking failed - %s does not match any trusted origins."
 REASON_NO_REFERER = "Referer checking failed - no Referer."
 REASON_BAD_REFERER = "Referer checking failed - %s does not match any trusted origins."
 REASON_NO_CSRF_COOKIE = "CSRF cookie not set."
@@ -103,8 +108,8 @@ def rotate_token(request):
 
 
 def _sanitize_token(token):
-    # Allow only ASCII alphanumerics
-    if re.search('[^a-zA-Z0-9]', token):
+    # Make sure all characters are in CSRF_ALLOWED_CHARS.
+    if invalid_token_chars_re.search(token):
         return _get_new_csrf_token()
     elif len(token) == CSRF_TOKEN_LENGTH:
         return token
@@ -128,6 +133,11 @@ def _compare_masked_tokens(request_csrf_token, csrf_token):
     )
 
 
+class RejectRequest(Exception):
+    def __init__(self, reason):
+        self.reason = reason
+
+
 class CsrfViewMiddleware(MiddlewareMixin):
     """
     Require a present and correct csrfmiddlewaretoken for POST requests that
@@ -136,6 +146,31 @@ class CsrfViewMiddleware(MiddlewareMixin):
     This middleware should be used in conjunction with the {% csrf_token %}
     template tag.
     """
+    @cached_property
+    def csrf_trusted_origins_hosts(self):
+        return [
+            urlparse(origin).netloc.lstrip('*')
+            for origin in settings.CSRF_TRUSTED_ORIGINS
+        ]
+
+    @cached_property
+    def allowed_origins_exact(self):
+        return {
+            origin for origin in settings.CSRF_TRUSTED_ORIGINS
+            if '*' not in origin
+        }
+
+    @cached_property
+    def allowed_origin_subdomains(self):
+        """
+        A mapping of allowed schemes to list of allowed netlocs, where all
+        subdomains of the netloc are allowed.
+        """
+        allowed_origin_subdomains = defaultdict(list)
+        for parsed in (urlparse(origin) for origin in settings.CSRF_TRUSTED_ORIGINS if '*' in origin):
+            allowed_origin_subdomains[parsed.scheme].append(parsed.netloc.lstrip('*'))
+        return allowed_origin_subdomains
+
     # The _accept and _reject methods currently only exist for the sake of the
     # requires_csrf_token decorator.
     def _accept(self, request):
@@ -196,6 +231,77 @@ class CsrfViewMiddleware(MiddlewareMixin):
             # Set the Vary header since content varies with the CSRF cookie.
             patch_vary_headers(response, ('Cookie',))
 
+    def _origin_verified(self, request):
+        request_origin = request.META['HTTP_ORIGIN']
+        try:
+            good_host = request.get_host()
+        except DisallowedHost:
+            pass
+        else:
+            good_origin = '%s://%s' % (
+                'https' if request.is_secure() else 'http',
+                good_host,
+            )
+            if request_origin == good_origin:
+                return True
+        if request_origin in self.allowed_origins_exact:
+            return True
+        try:
+            parsed_origin = urlparse(request_origin)
+        except ValueError:
+            return False
+        request_scheme = parsed_origin.scheme
+        request_netloc = parsed_origin.netloc
+        return any(
+            is_same_domain(request_netloc, host)
+            for host in self.allowed_origin_subdomains.get(request_scheme, ())
+        )
+
+    def _check_referer(self, request):
+        referer = request.META.get('HTTP_REFERER')
+        if referer is None:
+            raise RejectRequest(REASON_NO_REFERER)
+
+        try:
+            referer = urlparse(referer)
+        except ValueError:
+            raise RejectRequest(REASON_MALFORMED_REFERER)
+
+        # Make sure we have a valid URL for Referer.
+        if '' in (referer.scheme, referer.netloc):
+            raise RejectRequest(REASON_MALFORMED_REFERER)
+
+        # Ensure that our Referer is also secure.
+        if referer.scheme != 'https':
+            raise RejectRequest(REASON_INSECURE_REFERER)
+
+        if any(
+            is_same_domain(referer.netloc, host)
+            for host in self.csrf_trusted_origins_hosts
+        ):
+            return
+        # Allow matching the configured cookie domain.
+        good_referer = (
+            settings.SESSION_COOKIE_DOMAIN
+            if settings.CSRF_USE_SESSIONS
+            else settings.CSRF_COOKIE_DOMAIN
+        )
+        if good_referer is None:
+            # If no cookie domain is configured, allow matching the current
+            # host:port exactly if it's permitted by ALLOWED_HOSTS.
+            try:
+                # request.get_host() includes the port.
+                good_referer = request.get_host()
+            except DisallowedHost:
+                raise RejectRequest(REASON_BAD_REFERER % referer.geturl())
+        else:
+            server_port = request.get_port()
+            if server_port not in ('443', '80'):
+                good_referer = '%s:%s' % (good_referer, server_port)
+
+        if not is_same_domain(referer.netloc, good_referer):
+            raise RejectRequest(REASON_BAD_REFERER % referer.geturl())
+
     def process_request(self, request):
         csrf_token = self._get_token(request)
         if csrf_token is not None:
@@ -212,105 +318,74 @@ class CsrfViewMiddleware(MiddlewareMixin):
             return None
 
         # Assume that anything not defined as 'safe' by RFC7231 needs protection
-        if request.method not in ('GET', 'HEAD', 'OPTIONS', 'TRACE'):
-            if getattr(request, '_dont_enforce_csrf_checks', False):
-                # Mechanism to turn off CSRF checks for test suite.
-                # It comes after the creation of CSRF cookies, so that
-                # everything else continues to work exactly the same
-                # (e.g. cookies are sent, etc.), but before any
-                # branches that call reject().
-                return self._accept(request)
+        if request.method in ('GET', 'HEAD', 'OPTIONS', 'TRACE'):
+            return self._accept(request)
 
-            if request.is_secure():
-                # Suppose user visits http://example.com/
-                # An active network attacker (man-in-the-middle, MITM) sends a
-                # POST form that targets https://example.com/detonate-bomb/ and
-                # submits it via JavaScript.
-                #
-                # The attacker will need to provide a CSRF cookie and token, but
-                # that's no problem for a MITM and the session-independent
-                # secret we're using. So the MITM can circumvent the CSRF
-                # protection. This is true for any HTTP connection, but anyone
-                # using HTTPS expects better! For this reason, for
-                # https://example.com/ we need additional protection that treats
-                # http://example.com/ as completely untrusted. Under HTTPS,
-                # Barth et al. found that the Referer header is missing for
-                # same-domain requests in only about 0.2% of cases or less, so
-                # we can use strict Referer checking.
-                referer = request.META.get('HTTP_REFERER')
-                if referer is None:
-                    return self._reject(request, REASON_NO_REFERER)
+        if getattr(request, '_dont_enforce_csrf_checks', False):
+            # Mechanism to turn off CSRF checks for test suite. It comes after
+            # the creation of CSRF cookies, so that everything else continues
+            # to work exactly the same (e.g. cookies are sent, etc.), but
+            # before any branches that call reject().
+            return self._accept(request)
 
-                referer = urlparse(referer)
+        # Reject the request if the Origin header doesn't match an allowed
+        # value.
+        if 'HTTP_ORIGIN' in request.META:
+            if not self._origin_verified(request):
+                return self._reject(request, REASON_BAD_ORIGIN % request.META['HTTP_ORIGIN'])
+        elif request.is_secure():
+            # If the Origin header wasn't provided, reject HTTPS requests if
+            # the Referer header doesn't match an allowed value.
+            #
+            # Suppose user visits http://example.com/
+            # An active network attacker (man-in-the-middle, MITM) sends a
+            # POST form that targets https://example.com/detonate-bomb/ and
+            # submits it via JavaScript.
+            #
+            # The attacker will need to provide a CSRF cookie and token, but
+            # that's no problem for a MITM and the session-independent secret
+            # we're using. So the MITM can circumvent the CSRF protection. This
+            # is true for any HTTP connection, but anyone using HTTPS expects
+            # better! For this reason, for https://example.com/ we need
+            # additional protection that treats http://example.com/ as
+            # completely untrusted. Under HTTPS, Barth et al. found that the
+            # Referer header is missing for same-domain requests in only about
+            # 0.2% of cases or less, so we can use strict Referer checking.
+            try:
+                self._check_referer(request)
+            except RejectRequest as exc:
+                return self._reject(request, exc.reason)
 
-                # Make sure we have a valid URL for Referer.
-                if '' in (referer.scheme, referer.netloc):
-                    return self._reject(request, REASON_MALFORMED_REFERER)
+        # Access csrf_token via self._get_token() as rotate_token() may have
+        # been called by an authentication middleware during the
+        # process_request() phase.
+        csrf_token = self._get_token(request)
+        if csrf_token is None:
+            # No CSRF cookie. For POST requests, we insist on a CSRF cookie,
+            # and in this way we can avoid all CSRF attacks, including login
+            # CSRF.
+            return self._reject(request, REASON_NO_CSRF_COOKIE)
 
-                # Ensure that our Referer is also secure.
-                if referer.scheme != 'https':
-                    return self._reject(request, REASON_INSECURE_REFERER)
+        # Check non-cookie token for match.
+        request_csrf_token = ''
+        if request.method == 'POST':
+            try:
+                request_csrf_token = request.POST.get('csrfmiddlewaretoken', '')
+            except OSError:
+                # Handle a broken connection before we've completed reading the
+                # POST data. process_view shouldn't raise any exceptions, so
+                # we'll ignore and serve the user a 403 (assuming they're still
+                # listening, which they probably aren't because of the error).
+                pass
 
-                # If there isn't a CSRF_COOKIE_DOMAIN, require an exact match
-                # match on host:port. If not, obey the cookie rules (or those
-                # for the session cookie, if CSRF_USE_SESSIONS).
-                good_referer = (
-                    settings.SESSION_COOKIE_DOMAIN
-                    if settings.CSRF_USE_SESSIONS
-                    else settings.CSRF_COOKIE_DOMAIN
-                )
-                if good_referer is not None:
-                    server_port = request.get_port()
-                    if server_port not in ('443', '80'):
-                        good_referer = '%s:%s' % (good_referer, server_port)
-                else:
-                    try:
-                        # request.get_host() includes the port.
-                        good_referer = request.get_host()
-                    except DisallowedHost:
-                        pass
+        if request_csrf_token == '':
+            # Fall back to X-CSRFToken, to make things easier for AJAX, and
+            # possible for PUT/DELETE.
+            request_csrf_token = request.META.get(settings.CSRF_HEADER_NAME, '')
 
-                # Create a list of all acceptable HTTP referers, including the
-                # current host if it's permitted by ALLOWED_HOSTS.
-                good_hosts = list(settings.CSRF_TRUSTED_ORIGINS)
-                if good_referer is not None:
-                    good_hosts.append(good_referer)
-
-                if not any(is_same_domain(referer.netloc, host) for host in good_hosts):
-                    reason = REASON_BAD_REFERER % referer.geturl()
-                    return self._reject(request, reason)
-
-            # Access csrf_token via self._get_token() as rotate_token() may
-            # have been called by an authentication middleware during the
-            # process_request() phase.
-            csrf_token = self._get_token(request)
-            if csrf_token is None:
-                # No CSRF cookie. For POST requests, we insist on a CSRF cookie,
-                # and in this way we can avoid all CSRF attacks, including login
-                # CSRF.
-                return self._reject(request, REASON_NO_CSRF_COOKIE)
-
-            # Check non-cookie token for match.
-            request_csrf_token = ""
-            if request.method == "POST":
-                try:
-                    request_csrf_token = request.POST.get('csrfmiddlewaretoken', '')
-                except OSError:
-                    # Handle a broken connection before we've completed reading
-                    # the POST data. process_view shouldn't raise any
-                    # exceptions, so we'll ignore and serve the user a 403
-                    # (assuming they're still listening, which they probably
-                    # aren't because of the error).
-                    pass
-
-            if request_csrf_token == "":
-                # Fall back to X-CSRFToken, to make things easier for AJAX,
-                # and possible for PUT/DELETE.
-                request_csrf_token = request.META.get(settings.CSRF_HEADER_NAME, '')
-
-            request_csrf_token = _sanitize_token(request_csrf_token)
-            if not _compare_masked_tokens(request_csrf_token, csrf_token):
-                return self._reject(request, REASON_BAD_TOKEN)
+        request_csrf_token = _sanitize_token(request_csrf_token)
+        if not _compare_masked_tokens(request_csrf_token, csrf_token):
+            return self._reject(request, REASON_BAD_TOKEN)
 
         return self._accept(request)
 
